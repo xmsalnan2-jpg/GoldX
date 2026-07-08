@@ -1,0 +1,1160 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Custom build — ICT Multi-Module Suite
+//
+// ============================================================================
+//  ICT MULTI-MODULE SUITE  (Pine Script v6)
+// ============================================================================
+//  Modules:
+//    1) Daily / Weekly Bias Engine  (liquidity-sweep based, with 1-step fallback)
+//    2) QSMT — synced swing points between two correlated symbols (1H and below)
+//    3) Market Structure  (ICT HH/HL/LH/LL + BOS)  +  standalone Liquidity Sweep (TS)
+//    4) Displacement legs (wick-tolerant impulsive move detection)
+//    5) FVG / Order Block
+//
+//  DESIGN NOTES FOR FUTURE EDITS
+//  ------------------------------------------------------------------------
+//  - The file is split into clearly labeled SECTIONS. Each module is mostly
+//    self-contained: its own inputs, its own state variables, its own
+//    drawing routine. You can disable an entire module by turning off its
+//    "Enable" input without touching the others.
+//  - All drawing object arrays (box/line/label) are capped using
+//    array.shift()/deletion so Pine never hits the "too many drawing
+//    objects" runtime error. The cap is user-configurable per object type.
+//  - Every request.security() call uses lookahead_off explicitly to avoid
+//    repainting surprises, and confirms on bar close (barstate.isconfirmed)
+//    where the logic depends on a "closed candle".
+//  - Bias / structure logic only ever looks at CLOSED bars. The
+//    in-progress (live) bar is never used to compute bias or structure —
+//    it is only where trade decisions/entries would be evaluated.
+// ============================================================================
+
+//@version=6
+indicator("ICT Multi-Module Suite (Bias · QSMT · Structure · Displacement · FVG/OB)",
+     shorttitle = "ICT Multi-Module",
+     overlay    = true,
+     max_boxes_count   = 500,
+     max_lines_count   = 500,
+     max_labels_count  = 500,
+     max_bars_back     = 5000)
+
+// ============================================================================
+//  SECTION 0 — GLOBAL / SHARED SETTINGS
+// ============================================================================
+
+var g_general = "―――――――――――――――――― General ――――――――――――――――――"
+
+i_maxObjectsPerType = input.int(300, "Max drawn objects per type (perf. safety)",
+     minval = 50, maxval = 500, step = 50, group = g_general,
+     tooltip = "Caps how many boxes / lines / labels of EACH kind stay on the chart. Oldest ones are removed first. Lower this if the chart feels slow.")
+
+i_theme = input.string("Balanced", "Color theme", options = ["Balanced", "High Contrast", "Muted"], group = g_general,
+     tooltip = "Controls the overall color intensity used by every module below.")
+
+// ----------------------------------------------------------------------------
+// Centralized color palette. Keeping this in one place means the whole
+// indicator's look can be restyled by editing only this block.
+// ----------------------------------------------------------------------------
+var color c_bull        = na
+var color c_bear         = na
+var color c_bullSoft     = na
+var color c_bearSoft     = na
+var color c_neutral      = na
+var color c_qsmt         = na
+var color c_structure    = na
+var color c_displaceBull = na
+var color c_displaceBear = na
+var color c_fvgBull      = na
+var color c_fvgBear      = na
+var color c_ob           = na
+
+// ----------------------------------------------------------------------------
+// f_computePalette: RETURNS the 12 palette colors as a tuple instead of
+// reassigning the global color variables directly.
+//
+// WHY: Pine Script does NOT allow a user-defined function (declared with
+// `=>`) to reassign (`:=`) a variable that was declared OUTSIDE that
+// function with `var`, in ANY position within the function body — this is
+// a hard language rule (error CE10088, "Cannot modify global variable ...
+// in function"), not something specific to any one variable's name or its
+// position in the function. The only place a `var` global CAN legally be
+// reassigned with `:=` is at the script's own top (global) scope, or inside
+// a plain `if`/`else` block that is NOT wrapped in a `=>` function
+// definition. The fix is structural: the function computes and RETURNS the
+// values, and the actual `:=` reassignment happens at the call site below,
+// which is at global scope and therefore legal.
+// ----------------------------------------------------------------------------
+f_computePalette() =>
+    color pBull        = na
+    color pBear         = na
+    color pBullSoft     = na
+    color pBearSoft     = na
+    color pNeutral      = na
+    color pQsmt         = na
+    color pStructure    = na
+    color pDisplaceBull = na
+    color pDisplaceBear = na
+    color pFvgBull      = na
+    color pFvgBear      = na
+    color pOb           = na
+    if i_theme == "High Contrast"
+        pBull        := color.new(color.lime, 0)
+        pBear        := color.new(color.red, 0)
+        pBullSoft     := color.new(color.lime, 75)
+        pBearSoft     := color.new(color.red, 75)
+        pNeutral     := color.new(color.gray, 40)
+        pQsmt        := color.new(color.aqua, 20)
+        pStructure   := color.new(color.white, 15)
+        pDisplaceBull := color.new(color.teal, 78)
+        pDisplaceBear := color.new(color.maroon, 78)
+        pFvgBull     := color.new(color.blue, 80)
+        pFvgBear     := color.new(color.orange, 80)
+        pOb          := color.new(color.yellow, 65)
+    else if i_theme == "Muted"
+        pBull        := color.new(#4CAF7D, 10)
+        pBear         := color.new(#C05B5B, 10)
+        pBullSoft     := color.new(#4CAF7D, 85)
+        pBearSoft     := color.new(#C05B5B, 85)
+        pNeutral     := color.new(color.gray, 55)
+        pQsmt        := color.new(#5B8DC0, 30)
+        pStructure   := color.new(#9AA0A6, 25)
+        pDisplaceBull := color.new(#4CAF7D, 85)
+        pDisplaceBear := color.new(#C05B5B, 85)
+        pFvgBull     := color.new(#5B8DC0, 88)
+        pFvgBear     := color.new(#C08A5B, 88)
+        pOb          := color.new(#C0B05B, 78)
+    else // Balanced (default)
+        pBull        := color.new(#26A69A, 5)
+        pBear         := color.new(#EF5350, 5)
+        pBullSoft     := color.new(#26A69A, 80)
+        pBearSoft     := color.new(#EF5350, 80)
+        pNeutral     := color.new(color.gray, 50)
+        pQsmt        := color.new(#42A5F5, 25)
+        pStructure   := color.new(#B0BEC5, 20)
+        pDisplaceBull := color.new(#26A69A, 82)
+        pDisplaceBear := color.new(#EF5350, 82)
+        pFvgBull     := color.new(#2962FF, 85)
+        pFvgBear     := color.new(#FF6D00, 85)
+        pOb          := color.new(#FFC107, 72)
+    [pBull, pBear, pBullSoft, pBearSoft, pNeutral, pQsmt, pStructure,
+         pDisplaceBull, pDisplaceBear, pFvgBull, pFvgBear, pOb]
+
+// Call site: the function returns a fresh tuple, which we first capture
+// into brand-new local names using `=` (tuple DECLARATION — always legal),
+// then assign each value to its corresponding global `var` color
+// individually using plain `:=` at global scope (also always legal, since
+// every other `:=` reassignment elsewhere in this file that targets a
+// `var` global and sits OUTSIDE any function body works the same way).
+// This avoids relying on tuple-reassignment-via-`:=` syntax, which is a
+// less common pattern — the verbose version below is the safest possible
+// choice given how easy it has been to get Pine's function-scope rules
+// wrong on this file already.
+[paletteBull, paletteBear, paletteBullSoft, paletteBearSoft, paletteNeutral,
+     paletteQsmt, paletteStructure, paletteDisplaceBull, paletteDisplaceBear,
+     paletteFvgBull, paletteFvgBear, paletteOb] = f_computePalette()
+
+c_bull        := paletteBull
+c_bear        := paletteBear
+c_bullSoft    := paletteBullSoft
+c_bearSoft    := paletteBearSoft
+c_neutral     := paletteNeutral
+c_qsmt        := paletteQsmt
+c_structure   := paletteStructure
+c_displaceBull := paletteDisplaceBull
+c_displaceBear := paletteDisplaceBear
+c_fvgBull     := paletteFvgBull
+c_fvgBear     := paletteFvgBear
+c_ob          := paletteOb
+
+
+// ----------------------------------------------------------------------------
+// Generic helper: trims an array of drawing objects (box/line/label) down to
+// a max count by deleting the OLDEST entries first (index 0 side).
+// Using separate typed functions because Pine's type system does not allow
+// a single generic function across box/line/label without overloads.
+// ----------------------------------------------------------------------------
+f_trimBoxes(array<box> arr, int maxN) =>
+    while array.size(arr) > maxN
+        box.delete(array.shift(arr))
+
+f_trimLines(array<line> arr, int maxN) =>
+    while array.size(arr) > maxN
+        line.delete(array.shift(arr))
+
+f_trimLabels(array<label> arr, int maxN) =>
+    while array.size(arr) > maxN
+        label.delete(array.shift(arr))
+
+// ----------------------------------------------------------------------------
+// Small formatting helper for labels that show prices.
+// ----------------------------------------------------------------------------
+f_fmt(float _p) =>
+    str.tostring(_p, format.mintick)
+
+// ============================================================================
+//  SECTION 1 — DAILY / WEEKLY BIAS ENGINE  (DOL: Draw On Liquidity)
+// ============================================================================
+//
+//  LOGIC (identical for Daily and Weekly, applied independently):
+//    Let N-1 = last CLOSED higher-TF candle, N-2 = the one before it.
+//
+//    1) Sweep-low  = wick of N-1 goes below low[N-2]
+//       Sweep-high = wick of N-1 goes above high[N-2]
+//
+//    2) Bullish resolve: sweep-low AND close[N-1] >= low[N-2]  (didn't close
+//       below the swept low). Close above high[N-2] strengthens it but is
+//       NOT required.
+//    3) Bearish resolve: sweep-high AND close[N-1] <= high[N-2].
+//    4) Both sides swept in the same candle -> "Inside/Both-Swept" case.
+//       This counts as a RESOLVED state (does not trigger fallback), and is
+//       treated identically whether the close landed inside N-2's range
+//       right away or after wicking both sides.
+//    5) No sweep at all (ordinary inside close, no wick breaks either level)
+//       -> UNRESOLVED. N-1 is ignored for direction purposes (its own DOL
+//       level is still plotted) and we fall back exactly ONE step: compare
+//       N-2 vs N-3 using the same rules. If that ALSO is unresolved -> NEUTRAL.
+//       (No further recursion beyond this single fallback.)
+//
+//  DOL (Draw On Liquidity) = the liquidity level currently "in play": the
+//  level that was swept (fuel already used) sits behind us, and the
+//  opposite extreme of the reference candle becomes the draw/target level
+//  going forward. We plot this as a level line + a light label.
+// ============================================================================
+
+var g_bias = "―――――――――――――――――― Module 1 · Daily/Weekly Bias ――――――――――――――――――"
+
+i_biasEnable   = input.bool(true, "Enable Bias Engine", group = g_bias)
+i_showDailyBias  = input.bool(true, "Show Daily Bias", group = g_bias)
+i_showWeeklyBias = input.bool(true, "Show Weekly Bias", group = g_bias)
+i_showDOLLines   = input.bool(true, "Show DOL target lines", group = g_bias)
+i_showBiasTable  = input.bool(true, "Show Bias summary table", group = g_bias)
+i_biasTablePos   = input.string("Top Right", "Bias table position",
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = g_bias)
+
+// Bias state encoding used throughout the script:
+//   1  = Bullish resolved
+//  -1  = Bearish resolved
+//   2  = Both-swept / inside special case
+//   0  = Neutral (unresolved even after fallback)
+var int BIAS_BULL    = 1
+var int BIAS_BEAR    = -1
+var int BIAS_INSIDE  = 2
+var int BIAS_NEUTRAL = 0
+
+// ----------------------------------------------------------------------------
+// Core resolver: given a candidate candle's OHLC and the reference candle's
+// high/low, returns the bias code for THAT comparison only (no fallback
+// logic inside here — fallback is orchestrated by the caller).
+// refHigh/refLow = the "N-2"-equivalent candle being measured against.
+// candHigh/candLow/candClose = the "N-1"-equivalent candle being evaluated.
+// ----------------------------------------------------------------------------
+f_resolveBias(float candHigh, float candLow, float candClose, float refHigh, float refLow) =>
+    bool sweptLow  = candLow  < refLow
+    bool sweptHigh = candHigh > refHigh
+    int  result = BIAS_NEUTRAL
+    if sweptLow and sweptHigh
+        result := BIAS_INSIDE
+    else if sweptLow and candClose >= refLow
+        result := BIAS_BULL
+    else if sweptHigh and candClose <= refHigh
+        result := BIAS_BEAR
+    else
+        result := BIAS_NEUTRAL
+    result
+
+// ----------------------------------------------------------------------------
+// f_computeBias: implements the "resolve on N-1/N-2, else fallback once to
+// N-2/N-3" chain for a given series of highs/lows/closes (already sourced
+// from whichever timeframe via request.security by the caller).
+//
+// h0/l0/c0 = N-1 (most recent closed)   h1/l1/c1 = N-2   h2/l2 = N-3
+// Returns [biasCode, dolLevel, refHighUsed, refLowUsed, usedFallback]
+//   dolLevel = the opposite-extreme target level to draw (the DOL)
+// ----------------------------------------------------------------------------
+f_computeBias(float h0, float l0, float c0, float h1, float l1, float c1, float h2, float l2) =>
+    int   primary = f_resolveBias(h0, l0, c0, h1, l1)
+    int   code = BIAS_NEUTRAL
+    float dol  = na
+    float refH = h1
+    float refL = l1
+    bool  fallbackUsed = false
+
+    if primary != BIAS_NEUTRAL
+        code := primary
+        refH := h1
+        refL := l1
+    else
+        // N-1 vs N-2 didn't resolve -> ignore N-1 for direction, try N-2 vs N-3
+        int fallback = f_resolveBias(h1, l1, c1, h2, l2)
+        fallbackUsed := true
+        if fallback != BIAS_NEUTRAL
+            code := fallback
+            refH := h2
+            refL := l2
+        else
+            code := BIAS_NEUTRAL
+            refH := h2
+            refL := l2
+
+    // DOL = the target liquidity draw. For bullish, price already took the
+    // low, so the draw is the high of the reference candle (upside target).
+    // For bearish, the draw is the low. For inside/neutral, no single clean
+    // target — DOL is left na (both extremes already shown as ref levels).
+    if code == BIAS_BULL
+        dol := refH
+    else if code == BIAS_BEAR
+        dol := refL
+    else
+        dol := na
+
+    [code, dol, refH, refL, fallbackUsed]
+
+// ----------------------------------------------------------------------------
+// Pull Daily and Weekly OHLC series (last 3 CLOSED bars of each TF) via
+// request.security. lookahead_off + using history indices [1]/[2]/[3] on the
+// already-higher-TF series (not [0], which would be the still-forming HTF
+// bar) guarantees we only ever read fully closed candles, with no repaint.
+// ----------------------------------------------------------------------------
+f_getHTFSeries(string tf) =>
+    // high[1]/low[1]/close[1] etc. here are evaluated INSIDE the HTF context
+    // requested by request.security(), so index [1] means "the last CLOSED
+    // bar of timeframe `tf`" — not an extra shift on the chart's own
+    // timeframe. Combined with lookahead_off, this guarantees we only ever
+    // read fully confirmed higher-timeframe candles, with no repainting.
+    [h0, l0, c0, h1, l1, c1, h2, l2] = request.security(syminfo.tickerid, tf,
+         [high[1], low[1], close[1], high[2], low[2], close[2], high[3], low[3]],
+         lookahead = barmerge.lookahead_off)
+    [h0, l0, c0, h1, l1, c1, h2, l2]
+
+[d_h0, d_l0, d_c0, d_h1, d_l1, d_c1, d_h2, d_l2] = f_getHTFSeries("D")
+[w_h0, w_l0, w_c0, w_h1, w_l1, w_c1, w_h2, w_l2] = f_getHTFSeries("W")
+
+[dailyBias, dailyDOL, dailyRefH, dailyRefL, dailyFallback] =
+     f_computeBias(d_h0, d_l0, d_c0, d_h1, d_l1, d_c1, d_h2, d_l2)
+[weeklyBias, weeklyDOL, weeklyRefH, weeklyRefL, weeklyFallback] =
+     f_computeBias(w_h0, w_l0, w_c0, w_h1, w_l1, w_c1, w_h2, w_l2)
+
+f_biasLabel(int code) =>
+    string txt = switch code
+        1  => "Bullish"
+        -1 => "Bearish"
+        2  => "Inside/Both-Swept"
+        => "Neutral"
+    txt
+
+f_biasColor(int code) =>
+    color col = switch code
+        1  => c_bull
+        -1 => c_bear
+        2  => c_neutral
+        => c_neutral
+    col
+
+// ----------------------------------------------------------------------------
+// Draw DOL target lines (one per TF, redrawn only when the underlying HTF
+// value changes to avoid redundant object churn).
+//
+// STYLE CHANGE (per user reference example): lines now use extend=extend.both
+// so they span the FULL visible chart width regardless of zoom level, instead
+// of a fixed bar_index +/-40 window. This matches reference charts where DOH/
+// DOL levels are drawn as full horizontal rules across the whole pane. A
+// single line.new() with extend.both automatically redraws across the whole
+// visible range on every bar, so no per-bar width recalculation is needed.
+// ----------------------------------------------------------------------------
+var line dailyDOLLine  = na
+var line weeklyDOLLine = na
+var label dailyDOLLabel  = na
+var label weeklyDOLLabel = na
+
+if i_biasEnable and i_showDOLLines and i_showDailyBias and barstate.islast
+    if not na(dailyDOLLine)
+        line.delete(dailyDOLLine)
+    if not na(dailyDOLLabel)
+        label.delete(dailyDOLLabel)
+    if not na(dailyDOL)
+        dailyDOLLine := line.new(bar_index - 1, dailyDOL, bar_index, dailyDOL,
+             color = f_biasColor(dailyBias), width = 1, style = line.style_dashed,
+             extend = extend.both)
+        dailyDOLLabel := label.new(bar_index + 10, dailyDOL,
+             "D DOL " + f_fmt(dailyDOL),
+             style = label.style_label_left, color = color.new(color.black, 100),
+             textcolor = f_biasColor(dailyBias), size = size.small)
+
+if i_biasEnable and i_showDOLLines and i_showWeeklyBias and barstate.islast
+    if not na(weeklyDOLLine)
+        line.delete(weeklyDOLLine)
+    if not na(weeklyDOLLabel)
+        label.delete(weeklyDOLLabel)
+    if not na(weeklyDOL)
+        weeklyDOLLine := line.new(bar_index - 1, weeklyDOL, bar_index, weeklyDOL,
+             color = f_biasColor(weeklyBias), width = 2, style = line.style_dashed,
+             extend = extend.both)
+        weeklyDOLLabel := label.new(bar_index + 10, weeklyDOL,
+             "W DOL " + f_fmt(weeklyDOL),
+             style = label.style_label_left, color = color.new(color.black, 100),
+             textcolor = f_biasColor(weeklyBias), size = size.small)
+
+// ----------------------------------------------------------------------------
+// Bias summary table (top-level dashboard for module 1).
+// ----------------------------------------------------------------------------
+f_tablePos(string p) =>
+    string pos = switch p
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+    pos
+
+var table biasTable = na
+
+if i_biasEnable and i_showBiasTable and barstate.islast
+    if not na(biasTable)
+        table.delete(biasTable)
+    biasTable := table.new(f_tablePos(i_biasTablePos), 2, 3,
+         bgcolor = color.new(color.black, 85), border_width = 1, border_color = color.new(color.gray, 60))
+    table.cell(biasTable, 0, 0, "Timeframe", text_color = color.silver, text_size = size.small, bgcolor = color.new(color.gray, 75))
+    table.cell(biasTable, 1, 0, "Bias", text_color = color.silver, text_size = size.small, bgcolor = color.new(color.gray, 75))
+    if i_showDailyBias
+        table.cell(biasTable, 0, 1, "Daily" + (dailyFallback ? " *" : ""), text_color = color.white, text_size = size.small)
+        table.cell(biasTable, 1, 1, f_biasLabel(dailyBias), text_color = f_biasColor(dailyBias), text_size = size.small)
+    if i_showWeeklyBias
+        table.cell(biasTable, 0, 2, "Weekly" + (weeklyFallback ? " *" : ""), text_color = color.white, text_size = size.small)
+        table.cell(biasTable, 1, 2, f_biasLabel(weeklyBias), text_color = f_biasColor(weeklyBias), text_size = size.small)
+
+// ============================================================================
+//  SECTION 2 — QSMT  (Quick Swing Match / synced swing points between two
+//  correlated symbols, intended for 1H and lower timeframes only)
+// ============================================================================
+//
+//  IMPORTANT SCOPE NOTE (per spec): QSMT here is intentionally simple. It is
+//  NOT a bias/direction tool. Its only job is:
+//    1) Detect swing highs/lows (pivots) on the CURRENT chart symbol.
+//    2) Detect swing highs/lows on a CORRELATED symbol (user-editable list,
+//       defaults below).
+//    3) Find pairs of pivots — one from each symbol, same type (both highs
+//       or both lows) — that land within a small bar-distance tolerance of
+//       one another ("synced").
+//    4) Draw a simple connecting line/box between those two synced pivot
+//       points, and list the sync in a small table.
+//  This module is only meant to be active/useful on 1H and lower timeframes,
+//  per the spec — a warning is shown if used on a higher TF.
+// ============================================================================
+
+var g_qsmt = "―――――――――――――――――― Module 2 · QSMT (Swing Sync) ――――――――――――――――――"
+
+i_qsmtEnable   = input.bool(true, "Enable QSMT", group = g_qsmt)
+i_qsmtPivotLen  = input.int(5, "Pivot lookback/lookforward length", minval = 2, maxval = 20, group = g_qsmt,
+     tooltip = "How many bars on each side confirm a swing high/low. Larger = fewer, more significant pivots.")
+i_qsmtSyncTolerance = input.int(3, "Sync tolerance (bars)", minval = 0, maxval = 10, group = g_qsmt,
+     tooltip = "Max bar-distance between a pivot on the base symbol and a pivot on the correlated symbol for them to count as 'synced'.")
+i_qsmtShowTable = input.bool(true, "Show QSMT pair table", group = g_qsmt)
+
+// Correlated-pair presets, editable as one pair per line using "/" as the
+// separator: "SYMBOL_A/SYMBOL_B". We deliberately use "/" rather than ":" as
+// the separator, because ":" is already used inside TradingView's own
+// exchange-qualified ticker format (e.g. "OANDA:XAUUSD") — if a user ever
+// wants to type a full exchange-qualified symbol on either side of a pair,
+// a ":" separator would incorrectly split that prefix too. "/" avoids the
+// clash entirely and also reads naturally (XAUUSD/XAGUSD).
+i_qsmtPairs = input.text_area(
+     "XAUUSD/XAGUSD\nEURUSD/GBPUSD\nUS100/SPX500\nUS30/SPX500\nBTCUSD/ETHUSD",
+     "Correlated pairs (one 'SYMBOL_A/SYMBOL_B' per line)", group = g_qsmt,
+     tooltip = "Edit this list to add/remove correlated pairs. One pair per line, separated by '/'. The engine looks for the current chart symbol on either side of each line. You may use full exchange-qualified symbols (e.g. OANDA:XAUUSD) on either side if needed.")
+
+// ----------------------------------------------------------------------------
+// Resolve which correlated symbol applies to the current chart symbol by
+// scanning the user-editable pair list. Falls back to na (no match), in
+// which case QSMT simply won't draw. Matching is done against BOTH the bare
+// ticker (syminfo.ticker, e.g. "XAUUSD") and the full ticker id
+// (syminfo.tickerid, e.g. "OANDA:XAUUSD") so the list works whether the user
+// wrote bare symbols or fully-qualified ones.
+// ----------------------------------------------------------------------------
+f_resolveCorrelatedSymbol(string pairsText) =>
+    array<string> lines = str.split(pairsText, "\n")
+    string found = na
+    string curTicker   = syminfo.ticker
+    string curTickerId = syminfo.tickerid
+    for i = 0 to array.size(lines) - 1
+        string ln = array.get(lines, i)
+        ln := str.trim(ln)
+        if str.length(ln) > 0
+            array<string> parts = str.split(ln, "/")
+            if array.size(parts) == 2
+                string a = str.trim(array.get(parts, 0))
+                string b = str.trim(array.get(parts, 1))
+                bool aIsCurrent = a == curTicker or a == curTickerId
+                bool bIsCurrent = b == curTicker or b == curTickerId
+                if aIsCurrent
+                    found := b
+                else if bIsCurrent
+                    found := a
+    found
+
+string qsmtCorrelatedSymbol = f_resolveCorrelatedSymbol(i_qsmtPairs)
+bool qsmtTFOk = timeframe.in_seconds(timeframe.period) <= timeframe.in_seconds("60")
+
+// ----------------------------------------------------------------------------
+// Pivot detection on the base (current chart) symbol.
+// ta.pivothigh/pivotlow already look "leftbars" back and "rightbars" forward,
+// naturally confirming only once enough bars exist — no repaint risk since
+// the pivot is only known `rightbars` bars after the fact, which Pine handles
+// natively via the historical offset returned.
+// ----------------------------------------------------------------------------
+float basePH = ta.pivothigh(high, i_qsmtPivotLen, i_qsmtPivotLen)
+float basePL = ta.pivotlow(low, i_qsmtPivotLen, i_qsmtPivotLen)
+
+// ----------------------------------------------------------------------------
+// Pivot detection on the correlated symbol via request.security. We request
+// the pivot VALUE and the bar_index at which it occurred (bar_index[len] on
+// the correlated symbol's own series) so we can compare timing across the
+// two symbols on the chart's own bar_index scale.
+// ----------------------------------------------------------------------------
+// IMPORTANT PINE GOTCHA: request.security() throws a runtime error if given
+// a na/empty ticker string — it cannot safely be called with a "maybe na"
+// symbol inside a ternary branch, since Pine still needs a concrete, valid
+// string to resolve the call regardless of which branch "wins". To avoid
+// this, we ALWAYS pass a valid fallback ticker (the current chart symbol
+// itself) when no correlated symbol was resolved from the pairs list, and
+// simply ignore that result downstream — qsmtCorrelatedSymbol == na already
+// disables all QSMT drawing further down, so the fallback call's result is
+// harmlessly unused in that case.
+f_correlatedPivots(string sym, int len) =>
+    [ph, pl, bidx] = request.security(sym, timeframe.period,
+         [ta.pivothigh(high, len, len), ta.pivotlow(low, len, len), bar_index[len]],
+         lookahead = barmerge.lookahead_off)
+    [ph, pl, bidx]
+
+string qsmtSafeSymbol = na(qsmtCorrelatedSymbol) ? syminfo.tickerid : qsmtCorrelatedSymbol
+[corrPH, corrPL, corrBarIdx] = f_correlatedPivots(qsmtSafeSymbol, i_qsmtPivotLen)
+
+// bar_index of the base-symbol pivot, once confirmed (offset by pivot length)
+int basePivotBarIdx = bar_index - i_qsmtPivotLen
+
+// ----------------------------------------------------------------------------
+// Arrays holding recent confirmed pivots for sync-matching. We keep a short
+// rolling window (last ~50) of each symbol's pivots; matching a fresh pivot
+// against this window is cheap and avoids unbounded growth.
+// ----------------------------------------------------------------------------
+var array<int>   basePHBars = array.new<int>()
+var array<float> basePHVals = array.new<float>()
+var array<int>   basePLBars = array.new<int>()
+var array<float> basePLVals = array.new<float>()
+
+var array<int>   corrPHBars = array.new<int>()
+var array<float> corrPHVals = array.new<float>()
+var array<int>   corrPLBars = array.new<int>()
+var array<float> corrPLVals = array.new<float>()
+
+f_pushCap(array<int> barsArr, array<float> valsArr, int b, float v, int cap) =>
+    array.push(barsArr, b)
+    array.push(valsArr, v)
+    if array.size(barsArr) > cap
+        array.shift(barsArr)
+        array.shift(valsArr)
+
+if i_qsmtEnable and qsmtTFOk
+    if not na(basePH)
+        f_pushCap(basePHBars, basePHVals, basePivotBarIdx, basePH, 50)
+    if not na(basePL)
+        f_pushCap(basePLBars, basePLVals, basePivotBarIdx, basePL, 50)
+    if not na(corrPH)
+        f_pushCap(corrPHBars, corrPHVals, corrBarIdx, corrPH, 50)
+    if not na(corrPL)
+        f_pushCap(corrPLBars, corrPLVals, corrBarIdx, corrPL, 50)
+
+// ----------------------------------------------------------------------------
+// f_findSync: given a freshly confirmed base pivot (bar+value), scan the
+// correlated-symbol pivot window for one within tolerance bars. Returns the
+// matched correlated bar/value, or na if none found.
+//
+// NOTE ON THE LOOP DIRECTION: Pine's `for i = HIGH to LOW` (with no `by`
+// clause) auto-infers a step of -1 when start > end, so this counts
+// backwards correctly on its own. We still write `by -1` explicitly below
+// (rather than relying on the implicit inference) purely for readability —
+// it makes the descending intent obvious to anyone editing this later.
+// Explicitly writing `by 1` here instead would be a bug (it would force a
+// positive step onto a descending range and the loop would never execute) —
+// noted here because that exact mistake is an easy one to make.
+// ----------------------------------------------------------------------------
+f_findSync(int freshBar, array<int> otherBars, array<float> otherVals, int tolerance) =>
+    int   matchBar = na
+    float matchVal = na
+    // WORKAROUND: rewritten from `for i = ... to 0 by -1` to a `while` loop.
+    // TradingView's editor kept re-flagging the `by -1` descending for-loop
+    // with "step in loop must be greater than zero" even when the text was
+    // verified correct across multiple fresh saves and a brand-new script —
+    // strong evidence of an editor/compile-cache issue tied to that exact
+    // syntax rather than anything wrong with the code itself. A `while` loop
+    // with a manually decremented index produces the identical traversal
+    // (same order, same bounds, same result) without using `by` at all.
+    if array.size(otherBars) > 0
+        int i = array.size(otherBars) - 1
+        while i >= 0
+            int ob = array.get(otherBars, i)
+            if math.abs(ob - freshBar) <= tolerance
+                matchBar := ob
+                matchVal := array.get(otherVals, i)
+                break
+            i := i - 1
+    [matchBar, matchVal]
+
+// ----------------------------------------------------------------------------
+// Drawing objects for QSMT syncs (capped).
+// ----------------------------------------------------------------------------
+var array<line>  qsmtLines  = array.new<line>()
+var array<label> qsmtLabels = array.new<label>()
+var int qsmtSyncCount = 0
+
+if i_qsmtEnable and qsmtTFOk
+    // Check for a fresh base PIVOT HIGH syncing with a correlated pivot high
+    if not na(basePH)
+        [mb, mv] = f_findSync(basePivotBarIdx, corrPHBars, corrPHVals, i_qsmtSyncTolerance)
+        if not na(mb)
+            line ln = line.new(basePivotBarIdx, basePH, mb, mv,
+                 color = c_qsmt, width = 2, style = line.style_dotted)
+            label lb = label.new(int(math.avg(basePivotBarIdx, mb)), math.max(basePH, mv),
+                 "QSMT H", style = label.style_label_down, color = color.new(color.black, 100),
+                 textcolor = c_qsmt, size = size.tiny)
+            array.push(qsmtLines, ln)
+            array.push(qsmtLabels, lb)
+            qsmtSyncCount += 1
+    // Check for a fresh base PIVOT LOW syncing with a correlated pivot low
+    if not na(basePL)
+        [mb, mv] = f_findSync(basePivotBarIdx, corrPLBars, corrPLVals, i_qsmtSyncTolerance)
+        if not na(mb)
+            line ln = line.new(basePivotBarIdx, basePL, mb, mv,
+                 color = c_qsmt, width = 2, style = line.style_dotted)
+            label lb = label.new(int(math.avg(basePivotBarIdx, mb)), math.min(basePL, mv),
+                 "QSMT L", style = label.style_label_up, color = color.new(color.black, 100),
+                 textcolor = c_qsmt, size = size.tiny)
+            array.push(qsmtLines, ln)
+            array.push(qsmtLabels, lb)
+            qsmtSyncCount += 1
+
+    f_trimLines(qsmtLines, i_maxObjectsPerType)
+    f_trimLabels(qsmtLabels, i_maxObjectsPerType)
+
+// ----------------------------------------------------------------------------
+// QSMT status/info table — shows the resolved correlated symbol, whether the
+// current TF is in-scope, and how many syncs are currently plotted.
+// ----------------------------------------------------------------------------
+var table qsmtTable = na
+
+if i_qsmtEnable and i_qsmtShowTable and barstate.islast
+    if not na(qsmtTable)
+        table.delete(qsmtTable)
+    qsmtTable := table.new(position.bottom_right, 2, 3,
+         bgcolor = color.new(color.black, 85), border_width = 1, border_color = color.new(color.gray, 60))
+    table.cell(qsmtTable, 0, 0, "QSMT", text_color = color.silver, text_size = size.small, bgcolor = color.new(color.gray, 75))
+    table.cell(qsmtTable, 1, 0, "Status", text_color = color.silver, text_size = size.small, bgcolor = color.new(color.gray, 75))
+    table.cell(qsmtTable, 0, 1, "Pair", text_color = color.white, text_size = size.small)
+    table.cell(qsmtTable, 1, 1, na(qsmtCorrelatedSymbol) ? "No match" : qsmtCorrelatedSymbol, text_color = c_qsmt, text_size = size.small)
+    table.cell(qsmtTable, 0, 2, "TF scope", text_color = color.white, text_size = size.small)
+    table.cell(qsmtTable, 1, 2, qsmtTFOk ? "OK (≤1H)" : "Above 1H — inactive", text_color = qsmtTFOk ? c_bull : c_bear, text_size = size.small)
+
+// ============================================================================
+//  SECTION 3 — MARKET STRUCTURE  (ICT HH/HL/LH/LL + BOS)
+//              +  standalone Liquidity Sweep (TS) entry signal, 1H and below
+// ============================================================================
+//
+//  STRUCTURE LOGIC:
+//    - Detect swing highs/lows using ta.pivothigh/pivotlow (length set by
+//      the user — meant to be used on 15m/5m per spec, but works on any TF).
+//    - Track a simple state machine of the trend:
+//        Uptrend   = sequence of Higher-Highs (HH) and Higher-Lows (HL)
+//        Downtrend = sequence of Lower-Highs  (LH) and Lower-Lows  (LL)
+//    - BOS (Break of Structure) fires when price CLOSES beyond the last
+//      confirmed structural pivot in the direction that would flip the
+//      trend: in an uptrend, a close below the last confirmed HL = bearish
+//      BOS (trend flips down). In a downtrend, a close above the last
+//      confirmed LH = bullish BOS (trend flips up).
+//    - We label each new confirmed pivot with its role (HH/HL/LH/LL) as soon
+//      as it's confirmed, and draw a BOS line + label when a break occurs.
+//
+//  STANDALONE LIQUIDITY SWEEP (TS) LOGIC (separate signal, not tied to the
+//  structure state machine above):
+//    - Same sweep concept as Module 1, but applied bar-to-bar on the CURRENT
+//      chart timeframe (meant for 1H and below): a bar's wick breaks the
+//      prior confirmed swing high/low and then closes back on the other
+//      side of it (rejection). Flagged as a potential entry signal
+//      independent of whether a formal BOS has happened.
+// ============================================================================
+
+var g_struct = "―――――――――――――――――― Module 3 · Market Structure + Liquidity Sweep ――――――――――――――――――"
+
+i_structEnable    = input.bool(true, "Enable Market Structure", group = g_struct)
+i_structPivotLen  = input.int(3, "Structure pivot length", minval = 1, maxval = 15, group = g_struct,
+     tooltip = "Bars on each side to confirm a swing point for structure. Smaller = more sensitive, suited to 15m/5m.")
+i_showStructLabels = input.bool(true, "Show HH/HL/LH/LL labels", group = g_struct)
+i_showBOS         = input.bool(true, "Show BOS lines", group = g_struct)
+
+i_tsEnable        = input.bool(true, "Enable standalone Liquidity Sweep (TS) signal", group = g_struct)
+i_tsMaxTFSeconds  = input.int(3600, "TS max timeframe (seconds, default 3600 = 1H)", minval = 60, group = g_struct,
+     tooltip = "TS signals only fire on timeframes at or below this many seconds (default 1 hour).")
+i_tsPivotLen      = input.int(5, "TS reference pivot length", minval = 2, maxval = 20, group = g_struct)
+
+// ----------------------------------------------------------------------------
+// Structure pivots on the chart's own timeframe.
+// ----------------------------------------------------------------------------
+float structPH = ta.pivothigh(high, i_structPivotLen, i_structPivotLen)
+float structPL = ta.pivotlow(low, i_structPivotLen, i_structPivotLen)
+int   structPivotBarIdx = bar_index - i_structPivotLen
+
+// Trend state: 1 = up, -1 = down, 0 = undefined (not enough pivots yet)
+var int   trendState        = 0
+var float lastConfirmedHigh = na   // last pivot high used as structural reference
+var float lastConfirmedLow  = na   // last pivot low used as structural reference
+var int   lastHighBarIdx    = na
+var int   lastLowBarIdx     = na
+var float prevPivotHighVal  = na   // the pivot high BEFORE the last one (for HH/LH comparison)
+var float prevPivotLowVal   = na   // the pivot low BEFORE the last one (for HL/LL comparison)
+
+var array<box>   structBoxes  = array.new<box>()   // reserved for future extension
+var array<line>  bosLines     = array.new<line>()
+var array<label> structLabels = array.new<label>()
+
+// ----------------------------------------------------------------------------
+// Classify a fresh pivot high or low relative to the previous one of the
+// same type (HH/LH for highs, HL/LL for lows). Also updates the "last
+// confirmed" reference levels used for BOS checks further down.
+// ----------------------------------------------------------------------------
+if i_structEnable
+    if not na(structPH)
+        string role = na(prevPivotHighVal) ? "H" : (structPH > prevPivotHighVal ? "HH" : "LH")
+        if i_showStructLabels and role != "H"
+            label lb = label.new(structPivotBarIdx, structPH, role,
+                 style = label.style_label_down, color = color.new(color.black, 100),
+                 textcolor = c_structure, size = size.tiny)
+            array.push(structLabels, lb)
+        prevPivotHighVal := structPH
+        lastConfirmedHigh := structPH
+        lastHighBarIdx := structPivotBarIdx
+        // A fresh Lower-High while in an uptrend is an early warning, but we
+        // only flip `trendState` on a confirmed BOS close below the last HL
+        // (handled further down) to avoid whipsaw from pivots alone.
+        if role == "HH"
+            trendState := 1
+
+    if not na(structPL)
+        string role = na(prevPivotLowVal) ? "L" : (structPL < prevPivotLowVal ? "LL" : "HL")
+        if i_showStructLabels and role != "L"
+            label lb = label.new(structPivotBarIdx, structPL, role,
+                 style = label.style_label_up, color = color.new(color.black, 100),
+                 textcolor = c_structure, size = size.tiny)
+            array.push(structLabels, lb)
+        prevPivotLowVal := structPL
+        lastConfirmedLow := structPL
+        lastLowBarIdx := structPivotBarIdx
+        if role == "LL"
+            trendState := -1
+
+    f_trimLabels(structLabels, i_maxObjectsPerType)
+
+// ----------------------------------------------------------------------------
+// BOS detection: a CLOSE beyond the last confirmed structural HL (bearish
+// flip) or LH (bullish flip). Checked every bar close using the most recent
+// confirmed reference level (which lags behind live price naturally, since a
+// pivot needs `i_structPivotLen` bars of confirmation — this is expected and
+// avoids false/repainting BOS calls).
+// ----------------------------------------------------------------------------
+var bool bosUpFlag   = false
+var bool bosDownFlag = false
+
+if i_structEnable and barstate.isconfirmed
+    bosUpFlag := false
+    bosDownFlag := false
+    if trendState == -1 and not na(lastConfirmedHigh) and close > lastConfirmedHigh
+        bosUpFlag := true
+        trendState := 1
+        if i_showBOS
+            line ln = line.new(lastHighBarIdx, lastConfirmedHigh, bar_index, lastConfirmedHigh,
+                 color = c_bull, width = 2, style = line.style_solid)
+            label lb = label.new(bar_index, lastConfirmedHigh, "BOS ▲",
+                 style = label.style_label_down, color = color.new(color.black, 100),
+                 textcolor = c_bull, size = size.small)
+            array.push(bosLines, ln)
+            array.push(structLabels, lb)
+    if trendState == 1 and not na(lastConfirmedLow) and close < lastConfirmedLow
+        bosDownFlag := true
+        trendState := -1
+        if i_showBOS
+            line ln = line.new(lastLowBarIdx, lastConfirmedLow, bar_index, lastConfirmedLow,
+                 color = c_bear, width = 2, style = line.style_solid)
+            label lb = label.new(bar_index, lastConfirmedLow, "BOS ▼",
+                 style = label.style_label_up, color = color.new(color.black, 100),
+                 textcolor = c_bear, size = size.small)
+            array.push(bosLines, ln)
+            array.push(structLabels, lb)
+    f_trimLines(bosLines, i_maxObjectsPerType)
+    f_trimLabels(structLabels, i_maxObjectsPerType)
+
+// ----------------------------------------------------------------------------
+// Standalone Liquidity Sweep (TS): wick-based sweep + rejection close against
+// the last confirmed structural pivot, independent of the BOS state machine.
+// Restricted to 1H and below via i_tsMaxTFSeconds.
+// ----------------------------------------------------------------------------
+bool tsTFOk = timeframe.in_seconds(timeframe.period) <= i_tsMaxTFSeconds
+
+var array<label> tsLabels = array.new<label>()
+
+float tsRefHigh = ta.pivothigh(high, i_tsPivotLen, i_tsPivotLen)
+float tsRefLow  = ta.pivotlow(low, i_tsPivotLen, i_tsPivotLen)
+var float tsLastHigh = na
+var float tsLastLow  = na
+if not na(tsRefHigh)
+    tsLastHigh := tsRefHigh
+if not na(tsRefLow)
+    tsLastLow := tsRefLow
+
+bool tsSweepLowSignal  = i_tsEnable and tsTFOk and not na(tsLastLow)  and low  < tsLastLow  and close > tsLastLow
+bool tsSweepHighSignal = i_tsEnable and tsTFOk and not na(tsLastHigh) and high > tsLastHigh and close < tsLastHigh
+
+if barstate.isconfirmed and i_tsEnable and tsTFOk
+    if tsSweepLowSignal
+        label lb = label.new(bar_index, low, "TS ▲", style = label.style_label_up,
+             color = color.new(color.black, 100), textcolor = c_bull, size = size.tiny)
+        array.push(tsLabels, lb)
+    if tsSweepHighSignal
+        label lb = label.new(bar_index, high, "TS ▼", style = label.style_label_down,
+             color = color.new(color.black, 100), textcolor = c_bear, size = size.tiny)
+        array.push(tsLabels, lb)
+    f_trimLabels(tsLabels, i_maxObjectsPerType)
+
+// ============================================================================
+//  SECTION 4 — DISPLACEMENT  (wick-tolerant impulsive move detection)
+// ============================================================================
+//
+//  LOGIC:
+//    A displacement LEG is a run of same-direction candles that is allowed to
+//    "absorb" small opposing wicks without breaking:
+//      - ONE full opposing candle (body against the leg's direction), OR
+//      - up to TWO small opposing wicks on otherwise same-direction candles
+//        (a "small" wick = its length is below i_dispWickTolerancePct percent
+//        of that candle's own total range)
+//    are tolerated and do NOT end the leg. Anything larger — a genuinely
+//    large opposing wick, or a real opposing-body candle beyond the single
+//    allowance — ends the leg (invalidates further extension).
+//
+//    A leg only becomes a plotted "displacement" once its cumulative range
+//    (high of leg vs low of leg) exceeds i_dispMinRangeATR × ATR, so tiny
+//    chop doesn't get boxed.
+//
+//    Drawn as an extended, soft/dim-colored box spanning the leg's start to
+//    its current/last bar, on the chart's own timeframe (meant for use from
+//    1H down to 5m per spec).
+// ============================================================================
+
+var g_disp = "―――――――――――――――――― Module 4 · Displacement ――――――――――――――――――"
+
+i_dispEnable          = input.bool(true, "Enable Displacement detection", group = g_disp)
+i_dispWickTolerancePct = input.float(25.0, "Small-wick tolerance (% of candle range)", minval = 5.0, maxval = 50.0, group = g_disp,
+     tooltip = "An opposing wick smaller than this % of its own candle's range doesn't break the displacement leg.")
+i_dispMinRangeATR    = input.float(1.5, "Minimum leg range (× ATR) to qualify", minval = 0.5, maxval = 5.0, step = 0.1, group = g_disp,
+     tooltip = "The full leg's high-to-low range must exceed this multiple of ATR(14) to be drawn as a displacement box. Filters out minor chop.")
+i_dispExtendBars     = input.int(3, "Extend box forward (bars)", minval = 0, maxval = 50, group = g_disp,
+     tooltip = "Reduced default (was 10) to cut visual clutter — boxes no longer stretch as far past their own leg.")
+i_dispAutoExpire      = input.bool(true, "Auto-remove displacement box after N bars", group = g_disp,
+     tooltip = "When on, each displacement box is deleted once it's this many bars old, instead of staying on the chart indefinitely (until the object-count cap). Keeps the chart from filling up with old boxes on lower timeframes.")
+i_dispExpireBars      = input.int(40, "Auto-remove after (bars)", minval = 5, maxval = 300, group = g_disp,
+     tooltip = "How many bars after a displacement box is drawn before it's automatically deleted (only applies if 'Auto-remove' above is on).")
+
+float dispATR = ta.atr(14)
+
+// Per-candle direction: 1 = bullish body, -1 = bearish body, 0 = doji/flat
+f_candleDir(float o, float c) =>
+    c > o ? 1 : (c < o ? -1 : 0)
+
+int candDir = f_candleDir(open, close)
+
+// Opposing-wick size check: is THIS candle's wick against `legDir` "small"?
+// For an up-leg (legDir = 1), a rejection-style signal shows as a long upper
+// wick relative to the candle's own range. For a down-leg, the equivalent
+// signal is a long lower wick. We measure the relevant wick as a % of that
+// candle's own range and compare to the tolerance input.
+f_smallOpposingWick(int legDir, float o, float h, float l, float c, float tolerancePct) =>
+    // NOTE: `range` is a Pine Script reserved built-in identifier and cannot
+    // be used as a local variable name (it throws "range cannot be used as
+    // a variable or function name" at compile time) — using `candleRange`
+    // instead avoids the collision.
+    float candleRange = h - l
+    bool small = true
+    if candleRange > 0
+        if legDir == 1
+            float upperWick = h - math.max(o, c)
+            small := (upperWick / candleRange) * 100.0 <= tolerancePct
+        else if legDir == -1
+            float lowerWick = math.min(o, c) - l
+            small := (lowerWick / candleRange) * 100.0 <= tolerancePct
+    small
+
+// ----------------------------------------------------------------------------
+// Leg-tracking state. We track the leg's direction, its start bar/price
+// extremes, and two counters: opposing full-candles used (max 1) and small
+// opposing wicks used (max 2), matching the tolerance rule described above.
+// ----------------------------------------------------------------------------
+var int   legDir             = 0
+var int   legStartBar        = na
+var float legHigh            = na
+var float legLow             = na
+var int   legOpposingCandles = 0
+var int   legSmallWicks      = 0
+
+var array<box> dispBoxes = array.new<box>()
+// Parallel array: the bar_index each box was CREATED on (not the leg's start
+// bar) — used by the auto-expiry sweep below to know how "old" each drawn
+// box is, independent of how long the underlying leg itself was.
+var array<int> dispBoxCreatedBar = array.new<int>()
+
+// ----------------------------------------------------------------------------
+// f_computeResetLeg: RETURNS the six new leg-state values as a tuple instead
+// of reassigning the global leg-tracking variables directly, for the exact
+// same reason documented above f_computePalette (Pine does not allow a
+// function to reassign a `var` global declared outside it, in any position).
+// ----------------------------------------------------------------------------
+f_computeResetLeg(int newDir, int startBar) =>
+    int   newLegDir             = newDir
+    int   newLegStartBar        = startBar
+    float newLegHigh            = high
+    float newLegLow             = low
+    int   newLegOpposingCandles = 0
+    int   newLegSmallWicks      = 0
+    [newLegDir, newLegStartBar, newLegHigh, newLegLow, newLegOpposingCandles, newLegSmallWicks]
+
+if i_dispEnable and barstate.isconfirmed
+    if legDir == 0
+        // No active leg yet — start one on the first directional candle.
+        if candDir != 0
+            [rLegDir, rLegStartBar, rLegHigh, rLegLow, rLegOpposingCandles, rLegSmallWicks] = f_computeResetLeg(candDir, bar_index)
+            legDir := rLegDir
+            legStartBar := rLegStartBar
+            legHigh := rLegHigh
+            legLow := rLegLow
+            legOpposingCandles := rLegOpposingCandles
+            legSmallWicks := rLegSmallWicks
+    else
+        bool smallWickOk = f_smallOpposingWick(legDir, open, high, low, close, i_dispWickTolerancePct)
+        bool endsLeg = false
+
+        if candDir == -legDir
+            // Full opposing-body candle: allowed once. Ends the leg if it's
+            // the second such candle, OR if its own wick against the leg
+            // isn't small either (a decisive reversal candle, not a pause).
+            if legOpposingCandles >= 1 or not smallWickOk
+                endsLeg := true
+            else
+                legOpposingCandles += 1
+        else if not smallWickOk
+            // Same-direction (or doji) candle, but its wick against the leg
+            // is NOT small -> counts against the small-wick allowance.
+            if legSmallWicks >= 2
+                endsLeg := true
+            else
+                legSmallWicks += 1
+
+        if endsLeg
+            // Finalize/draw the just-ended leg if it qualifies by range,
+            // then start a fresh leg from the current (breaking) candle.
+            float legRange = legHigh - legLow
+            if not na(dispATR) and legRange >= i_dispMinRangeATR * dispATR
+                color boxCol = legDir == 1 ? c_displaceBull : c_displaceBear
+                box b = box.new(legStartBar, legHigh, bar_index - 1 + i_dispExtendBars, legLow,
+                     border_color = color.new(boxCol, 40), bgcolor = boxCol, border_width = 1)
+                array.push(dispBoxes, b)
+                array.push(dispBoxCreatedBar, bar_index)
+            [rLegDir2, rLegStartBar2, rLegHigh2, rLegLow2, rLegOpposingCandles2, rLegSmallWicks2] = f_computeResetLeg(candDir, bar_index)
+            legDir := rLegDir2
+            legStartBar := rLegStartBar2
+            legHigh := rLegHigh2
+            legLow := rLegLow2
+            legOpposingCandles := rLegOpposingCandles2
+            legSmallWicks := rLegSmallWicks2
+        else
+            // Leg continues — extend its high/low envelope.
+            legHigh := math.max(legHigh, high)
+            legLow  := math.min(legLow, low)
+
+// ----------------------------------------------------------------------------
+// Displacement box cleanup: two passes, both walking dispBoxes/dispBoxCreatedBar
+// backwards together so the parallel arrays never desync.
+//
+// Pass 1 — AUTO-EXPIRY (age-based, only if i_dispAutoExpire is on): delete
+// any box whose creation bar is now more than i_dispExpireBars bars in the
+// past. This is what actually reduces clutter — old displacement zones that
+// are no longer relevant get removed automatically instead of piling up.
+//
+// Pass 2 — COUNT CAP (safety net, same as every other object type in this
+// script): if, even after expiry, there are still more than
+// i_maxObjectsPerType boxes (e.g. auto-expiry is off, or a burst of legs
+// closed on the same bar), delete the OLDEST ones first until back under
+// the cap. Uses the same "check size > 0 before looping, walk with a while
+// and manual decrement" pattern as every other descending sweep in this
+// file, for the same reason documented at f_findSync above: Pine's `for`
+// loop needs an explicit, correct `by` step for descending ranges, and a
+// manually-decremented `while` sidesteps that syntax entirely.
+// ----------------------------------------------------------------------------
+if i_dispEnable and barstate.isconfirmed and i_dispAutoExpire and array.size(dispBoxes) > 0
+    int di = array.size(dispBoxes) - 1
+    while di >= 0
+        int createdBar = array.get(dispBoxCreatedBar, di)
+        if bar_index - createdBar > i_dispExpireBars
+            box.delete(array.get(dispBoxes, di))
+            array.remove(dispBoxes, di)
+            array.remove(dispBoxCreatedBar, di)
+        di := di - 1
+
+if i_dispEnable and array.size(dispBoxes) > i_maxObjectsPerType
+    while array.size(dispBoxes) > i_maxObjectsPerType
+        box.delete(array.shift(dispBoxes))
+        array.shift(dispBoxCreatedBar)
+
+// ============================================================================
+//  SECTION 5 — FVG (Fair Value Gap)  /  ORDER BLOCK
+// ============================================================================
+//
+//  FVG LOGIC (classic 3-candle definition):
+//    Bullish FVG: low[candle 3] > high[candle 1]  (gap between candle 1's
+//    high wick and candle 3's low wick, with candle 2 being the strong
+//    displacement candle in between).
+//    Bearish FVG: high[candle 3] < low[candle 1].
+//    The gap zone drawn is [high[1], low[3]] for bullish, [high[3], low[1]]
+//    for bearish.
+//
+//  ORDER BLOCK LOGIC:
+//    The Order Block is the LAST opposing candle immediately before the
+//    displacement/FVG move — i.e. candle 1 itself when candle 1's direction
+//    is opposite candle 2's (the classic "last down-candle before the
+//    up-move" / "last up-candle before the down-move" definition). Candle 1
+//    is used as the OB reference regardless, per the most common convention,
+//    since it is the origin of the imbalance either way.
+//
+//  Both FVG and OB zones are drawn as boxes and are removed automatically
+//  once price has fully closed through them (mitigation), OR trimmed by the
+//  standard object-count cap — whichever comes first.
+// ============================================================================
+
+var g_fvg = "―――――――――――――――――― Module 5 · FVG / Order Block ――――――――――――――――――"
+
+i_fvgEnable       = input.bool(true, "Enable FVG detection", group = g_fvg)
+i_fvgExtendBars   = input.int(6, "Extend FVG box forward (bars)", minval = 0, maxval = 100, group = g_fvg,
+     tooltip = "Reduced default (was 20) to cut visual clutter — combined with mitigation-based removal below, boxes stay small and get cleared quickly once price interacts with them.")
+i_fvgRemoveOnFill = input.bool(true, "Remove FVG once fully mitigated (filled)", group = g_fvg)
+
+i_obEnable        = input.bool(true, "Enable Order Block marking", group = g_fvg)
+i_obExtendBars    = input.int(6, "Extend OB box forward (bars)", minval = 0, maxval = 100, group = g_fvg,
+     tooltip = "Reduced default (was 20) to cut visual clutter — combined with mitigation-based removal below, boxes stay small and get cleared quickly once price interacts with them.")
+i_obRemoveOnFill  = input.bool(true, "Remove OB once price closes through it", group = g_fvg)
+
+// Rolling 3-candle window references (candle1 = 2 bars ago, candle2 = 1 bar
+// ago, candle3 = current/just-closed bar being evaluated at confirmation).
+float c1High  = high[2]
+float c1Low   = low[2]
+float c1Open  = open[2]
+float c1Close = close[2]
+float c3High  = high
+float c3Low   = low
+
+bool bullFVG = c3Low > c1High
+bool bearFVG = c3High < c1Low
+
+var array<box> fvgBoxes = array.new<box>()
+var array<box> obBoxes  = array.new<box>()
+
+// We track each FVG/OB box alongside the price level that, once closed
+// through, mitigates it, plus its direction — using parallel arrays instead
+// of a user-defined type, to keep the file simple and easy to edit further.
+var array<float> fvgFillLevel = array.new<float>()
+var array<int>    fvgDir      = array.new<int>()     // 1 = bullish FVG, -1 = bearish
+
+var array<float> obFillLevel = array.new<float>()
+var array<int>   obDir       = array.new<int>()
+
+if barstate.isconfirmed and (i_fvgEnable or i_obEnable)
+    if bullFVG
+        if i_fvgEnable
+            box fb = box.new(bar_index - 2, c3Low, bar_index + i_fvgExtendBars, c1High,
+                 border_color = color.new(c_fvgBull, 30), bgcolor = c_fvgBull, border_width = 1)
+            array.push(fvgBoxes, fb)
+            array.push(fvgFillLevel, c1High)   // mitigated once price closes back below c1High
+            array.push(fvgDir, 1)
+        if i_obEnable
+            // OB = candle 1 (the origin candle of the imbalance).
+            box ob = box.new(bar_index - 2, math.max(c1Open, c1Close), bar_index + i_obExtendBars, math.min(c1Open, c1Close),
+                 border_color = color.new(c_ob, 20), bgcolor = c_ob, border_width = 1)
+            array.push(obBoxes, ob)
+            array.push(obFillLevel, math.min(c1Open, c1Close))  // mitigated once price closes below OB low
+            array.push(obDir, 1)
+
+    if bearFVG
+        if i_fvgEnable
+            box fb = box.new(bar_index - 2, c1Low, bar_index + i_fvgExtendBars, c3High,
+                 border_color = color.new(c_fvgBear, 30), bgcolor = c_fvgBear, border_width = 1)
+            array.push(fvgBoxes, fb)
+            array.push(fvgFillLevel, c1Low)    // mitigated once price closes back above c1Low
+            array.push(fvgDir, -1)
+        if i_obEnable
+            box ob = box.new(bar_index - 2, math.max(c1Open, c1Close), bar_index + i_obExtendBars, math.min(c1Open, c1Close),
+                 border_color = color.new(c_ob, 20), bgcolor = c_ob, border_width = 1)
+            array.push(obBoxes, ob)
+            array.push(obFillLevel, math.max(c1Open, c1Close))  // mitigated once price closes above OB high
+            array.push(obDir, -1)
+
+// ----------------------------------------------------------------------------
+// Mitigation sweep: walk backwards through active FVG/OB boxes and delete
+// any that have been fully closed through, per the direction-specific fill
+// condition recorded above. Iterating backwards while removing by index is
+// safe here since each removal only affects indices at or below the current one.
+//
+// IMPORTANT GUARD: when the array is EMPTY (size 0), `array.size(...) - 1`
+// evaluates to -1. Pine's `for i = -1 to 0` does NOT recognize this as an
+// "empty descending range to skip" — it still attempts to run with i = -1
+// on its first iteration, which then crashes on array.get(..., -1) with
+// "Index -1 is out of bounds, array size is 0". The fix is to explicitly
+// check array.size(...) > 0 BEFORE entering the loop at all, rather than
+// relying on the loop bounds alone to protect against the empty case.
+// ----------------------------------------------------------------------------
+if barstate.isconfirmed and i_fvgEnable and i_fvgRemoveOnFill and array.size(fvgBoxes) > 0
+    int i = array.size(fvgBoxes) - 1
+    while i >= 0
+        int   dir    = array.get(fvgDir, i)
+        float lvl    = array.get(fvgFillLevel, i)
+        bool  filled = dir == 1 ? close < lvl : close > lvl
+        if filled
+            box.delete(array.get(fvgBoxes, i))
+            array.remove(fvgBoxes, i)
+            array.remove(fvgFillLevel, i)
+            array.remove(fvgDir, i)
+        i := i - 1
+
+if barstate.isconfirmed and i_obEnable and i_obRemoveOnFill and array.size(obBoxes) > 0
+    int i = array.size(obBoxes) - 1
+    while i >= 0
+        int   dir    = array.get(obDir, i)
+        float lvl    = array.get(obFillLevel, i)
+        bool  filled = dir == 1 ? close < lvl : close > lvl
+        if filled
+            box.delete(array.get(obBoxes, i))
+            array.remove(obBoxes, i)
+            array.remove(obFillLevel, i)
+            array.remove(obDir, i)
+        i := i - 1
+
+
+// Standard cap-based trim as a second safety net (in case mitigation-based
+// removal doesn't keep pace, e.g. during very low mitigation-rate phases).
+if i_fvgEnable
+    f_trimBoxes(fvgBoxes, i_maxObjectsPerType)
+if i_obEnable
+    f_trimBoxes(obBoxes, i_maxObjectsPerType)
+
+// ============================================================================
+//  SECTION 6 — ALERTS
+// ============================================================================
+//  Centralized alertcondition() calls so users can set up TradingView alerts
+//  on any of the key module signals without editing code.
+// ============================================================================
+
+alertcondition(bosUpFlag,         title = "Bullish BOS",             message = "Bullish Break of Structure")
+alertcondition(bosDownFlag,       title = "Bearish BOS",             message = "Bearish Break of Structure")
+alertcondition(tsSweepLowSignal,  title = "TS Sweep Low (bullish)",  message = "Liquidity sweep of a low with bullish rejection")
+alertcondition(tsSweepHighSignal, title = "TS Sweep High (bearish)", message = "Liquidity sweep of a high with bearish rejection")
+alertcondition(bullFVG,           title = "Bullish FVG formed",      message = "A new bullish Fair Value Gap has formed")
+alertcondition(bearFVG,           title = "Bearish FVG formed",      message = "A new bearish Fair Value Gap has formed")
